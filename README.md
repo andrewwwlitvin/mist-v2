@@ -231,59 +231,6 @@ the pattern learned by finetuning. The finetuned model will also add the fixed b
 
 This project is licensed under the Apache-2.0 license. Additionally, we forbid any unauthorized commercial use. Mist series will be permanently free and open-sourced. Currently, we do not cooperate with any person or organization for commercial purpose.
 
- 
-## Citation
-
-If you find this repo useful, we kindly suggest you to cite our paper.
-```
-@article{zheng2023understanding,
-  title={Understanding and Improving Adversarial Attacks on Latent Diffusion Model},
-  author={Zheng, Boyang and Liang, Chumeng and Wu, Xiaoyu and Liu, Yan},
-  journal={arXiv preprint arXiv:2310.04687},
-  year={2023}
-}
-```
-Additionally, Mist-v2 benefits from the following papers. Their ideas and results inspire us to dive into the mechanism why adversarial attacks work on latent diffusion models. We kindly suggest you to cite them if possible. 
-
-```
-@inproceedings{liang2023adversarial,
-  title={Adversarial example does good: Preventing painting imitation from diffusion models via adversarial examples},
-  author={Liang, Chumeng and Wu, Xiaoyu and Hua, Yang and Zhang, Jiaru and Xue, Yiming and Song, Tao and Xue, Zhengui and Ma, Ruhui and Guan, Haibing},
-  booktitle={International Conference on Machine Learning},
-  pages={20763--20786},
-  year={2023},
-  organization={PMLR}
-}
-```
-
-```
-@article{xue2023toward,
-  title={Toward effective protection against diffusion based mimicry through score distillation},
-  author={Xue, Haotian and Liang, Chumeng and Wu, Xiaoyu and Chen, Yongxin},
-  journal={arXiv preprint arXiv:2311.12832},
-  year={2023}
-}
-```
-
-```
-@inproceedings{van2023anti,
-  title={Anti-DreamBooth: Protecting users from personalized text-to-image synthesis},
-  author={Van Le, Thanh and Phung, Hao and Nguyen, Thuan Hoang and Dao, Quan and Tran, Ngoc N and Tran, Anh},
-  booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision},
-  pages={2116--2127},
-  year={2023}
-}
-```
-
-```
-@article{liang2023mist,
-  title={Mist: Towards Improved Adversarial Examples for Diffusion Models},
-  author={Liang, Chumeng and Wu, Xiaoyu},
-  journal={arXiv preprint arXiv:2305.12683},
-  year={2023}
-}
-```
-
 
 
 
