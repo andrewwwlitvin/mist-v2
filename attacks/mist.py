@@ -79,6 +79,13 @@ def parse_args(input_args=None):
     parser.add_argument("--low_vram_mode", action='store_true', help="Whether or not to use low vram mode (true/false).")
     parser.add_argument("--pgd_alpha", type=str, default="0.005", help="The step size for pgd.")
     parser.add_argument("--pgd_eps", type=str, default=str(8.0/255.0), help="The noise budget for pgd.")
+    parser.add_argument(
+        "--eps_map_path",
+        type=str,
+        default="",
+        help="Path to .npy file containing per-pixel epsilon map (H×W float32). "
+             "If empty or file not found, falls back to uniform pgd_eps."
+    )
     parser.add_argument("--fused_weight", type=str, default="0.00001", help="The decay of alpha and eps when applying pre-attack")
     parser.add_argument("--target_image_path", type=str, default="data/MIST.png", help="Target image for attacking")
     parser.add_argument("--lora_rank", type=str, default="4", help="Rank of LoRA approximation.")
@@ -552,6 +559,15 @@ def pgd_attack(
     unet.requires_grad_(False)
     data_tensor = data_tensor.detach().clone()
     num_image = len(data_tensor)
+
+    # Load adaptive epsilon map if provided
+    eps_map_tensor = None
+    if args.eps_map_path and os.path.exists(args.eps_map_path):
+        import numpy as np
+        eps_map_np = np.load(args.eps_map_path).astype(np.float32)  # H×W
+        eps_map_tensor = torch.from_numpy(eps_map_np).to(device, dtype=weight_dtype)
+        eps_map_tensor = eps_map_tensor.unsqueeze(0).unsqueeze(0)   # → [1, 1, H, W]
+
     image_list = []
     tbar = tqdm(range(num_image))
     tbar.set_description("PGD attack")
@@ -630,7 +646,10 @@ def pgd_attack(
                 alpha = args.pgd_alpha
                 adv_images = perturbed_image + alpha * perturbed_image.grad.sign()
                 eps = args.pgd_eps
-                eta = torch.clamp(adv_images - original_image, min=-eps, max=+eps)
+                if eps_map_tensor is not None:
+                    eta = torch.clamp(adv_images - original_image, min=-eps_map_tensor, max=+eps_map_tensor)
+                else:
+                    eta = torch.clamp(adv_images - original_image, min=-eps, max=+eps)
                 perturbed_image = torch.clamp(original_image + eta, min=-1, max=+1).detach_()
                 perturbed_image.requires_grad = True
 
