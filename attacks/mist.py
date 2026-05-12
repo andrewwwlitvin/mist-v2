@@ -734,6 +734,7 @@ def main(args):
                 torch_dtype = torch.bfloat16
             pipeline = DiffusionPipeline.from_pretrained(
                 args.pretrained_model_name_or_path,
+                variant="fp16",
                 torch_dtype=torch_dtype,
                 safety_checker=None,
                 revision=args.revision,
