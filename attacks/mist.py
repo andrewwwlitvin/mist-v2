@@ -778,7 +778,11 @@ def main(args):
         torch_dtype=torch.float16,
     )
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
+        args.pretrained_model_name_or_path,
+        subfolder="unet",
+        revision=args.revision,
+        variant="fp16",
+        torch_dtype=torch.float16,
     )
 
     # add by lora
