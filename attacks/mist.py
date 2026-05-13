@@ -800,11 +800,19 @@ def main(args):
     noise_scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     if not args.cuda:
         vae = AutoencoderKL.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision
+            args.pretrained_model_name_or_path,
+            subfolder="vae",
+            revision=args.revision,
+            variant="fp16",
+            torch_dtype=torch.float16,
         ).cuda()
     else:
         vae = AutoencoderKL.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision
+            args.pretrained_model_name_or_path,
+            subfolder="vae",
+            revision=args.revision,
+            variant="fp16",
+            torch_dtype=torch.float16,
         )
     vae.to(accelerator.device, dtype=weight_dtype)
     vae.requires_grad_(False)
