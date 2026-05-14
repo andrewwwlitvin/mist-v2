@@ -647,6 +647,7 @@ def pgd_attack(
                 adv_images = perturbed_image + alpha * perturbed_image.grad.sign()
                 eps = args.pgd_eps
                 if eps_map_tensor is not None:
+                    eps_map_tensor = eps_map_tensor.to(adv_images.device, dtype=adv_images.dtype)
                     eta = torch.clamp(adv_images - original_image, min=-eps_map_tensor, max=+eps_map_tensor)
                 else:
                     eta = torch.clamp(adv_images - original_image, min=-eps, max=+eps)
