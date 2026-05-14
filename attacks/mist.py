@@ -909,21 +909,23 @@ def main(args):
             noised_imgs = perturbed_data.detach().cpu()
             origin_imgs = original_data.detach().cpu()
             img_names = []
+            orig_names = []
             for filename in os.listdir(args.instance_data_dir):
                 if filename.lower().endswith(".png") or filename.lower().endswith(".jpg") or filename.lower().endswith(".jpeg"):
-                    # change the suffix to png
+                    orig_names.append(str(filename))
+                    # change the suffix to png for saving
                     filename = filename.split('.')[0] + '.png'
                     img_names.append(str(filename))
-            for img_pixel, ori_img_pixel, img_name, img_size in zip(noised_imgs, origin_imgs, img_names, data_sizes):
-                
+            for img_pixel, ori_img_pixel, img_name, orig_name, img_size in zip(noised_imgs, origin_imgs, img_names, orig_names, data_sizes):
+
                 save_path = os.path.join(save_folder, f"{i+1}_noise_{img_name}")
-                
+
                 if not args.resize:
                     Image.fromarray(
                         (img_pixel * 127.5 + 128).clamp(0, 255).to(torch.uint8).permute(1, 2, 0).numpy()
                     ).save(save_path)
                 else:
-                    ori_img_path = os.path.join(args.instance_data_dir, img_name)
+                    ori_img_path = os.path.join(args.instance_data_dir, orig_name)
                     ori_img = np.array(Image.open(ori_img_path).convert("RGB"))
 
                     ori_img_duzzy = np.array(Image.fromarray(
