@@ -326,6 +326,7 @@ def train_one_epoch(
 ):
     # prepare training data
     actual_tokenizer = tokenizer[0] if isinstance(tokenizer, tuple) else tokenizer
+    actual_tokenizer_2 = tokenizer[1] if isinstance(tokenizer, tuple) else None
     train_dataset = DreamBoothDatasetFromTensor(
         data_tensor,
         prompts,
@@ -350,6 +351,9 @@ def train_one_epoch(
     vae.to(dtype=weight_dtype)
     text_encoder.to(dtype=weight_dtype)
     unet.to(dtype=weight_dtype)
+    if is_sdxl:
+        text_encoder_2.to(device, dtype=weight_dtype)
+        text_encoder_2.requires_grad_(False)
     if args.low_vram_mode:
         set_use_memory_efficient_attention_xformers(unet,True)
 
@@ -450,9 +454,25 @@ def train_one_epoch(
                     # Add noise to the latents according to the noise magnitude at each timestep
                     # (this is the forward diffusion process)
                     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-                    # encode text
+                    # encode text + unet forward
                     input_id = input_ids[k, :].unsqueeze(0)
-                    encode_hidden_states = text_encoder(input_id)[0]
+                    if is_sdxl:
+                        prompt_str = args.instance_prompt if k == 0 else args.class_prompt
+                        input_id_2 = actual_tokenizer_2(
+                            prompt_str,
+                            truncation=True,
+                            padding="max_length",
+                            max_length=actual_tokenizer_2.model_max_length,
+                            return_tensors="pt",
+                        ).input_ids.to(device)
+                        model_pred = compute_sdxl_noise_pred(
+                            unet, text_encoder, text_encoder_2,
+                            noisy_latents, timesteps, (input_id, input_id_2),
+                            args.resolution, device, weight_dtype,
+                        )
+                    else:
+                        encode_hidden_states = text_encoder(input_id)[0]
+                        model_pred = unet(noisy_latents, timesteps, encode_hidden_states).sample
                     # Get the target for loss depending on the prediction type
                     if noise_scheduler.config.prediction_type == "epsilon":
                         target = noise
@@ -460,7 +480,6 @@ def train_one_epoch(
                         target = noise_scheduler.get_velocity(latents, noise, timesteps)
                     else:
                         raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-                    model_pred= unet(noisy_latents, timesteps, encode_hidden_states).sample
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                     if k == 1:
                         # calculate loss of class(prior)
@@ -504,9 +523,25 @@ def train_one_epoch(
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-                # encode text
+                # encode text + unet forward
                 input_id = input_ids[k, :].unsqueeze(0)
-                encode_hidden_states = text_encoder(input_id)[0]
+                if is_sdxl:
+                    prompt_str = args.instance_prompt if k == 0 else args.class_prompt
+                    input_id_2 = actual_tokenizer_2(
+                        prompt_str,
+                        truncation=True,
+                        padding="max_length",
+                        max_length=actual_tokenizer_2.model_max_length,
+                        return_tensors="pt",
+                    ).input_ids.to(device)
+                    model_pred = compute_sdxl_noise_pred(
+                        unet, text_encoder, text_encoder_2,
+                        noisy_latents, timesteps, (input_id, input_id_2),
+                        args.resolution, device, weight_dtype,
+                    )
+                else:
+                    encode_hidden_states = text_encoder(input_id)[0]
+                    model_pred = unet(noisy_latents, timesteps, encode_hidden_states).sample
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
@@ -514,7 +549,6 @@ def train_one_epoch(
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-                model_pred= unet(noisy_latents, timesteps, encode_hidden_states).sample
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 if k == 1:
                     # calculate loss of class(prior)
