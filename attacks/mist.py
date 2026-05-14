@@ -30,7 +30,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
 from torch.cuda.amp import GradScaler, autocast
-from transformers import AutoTokenizer, PretrainedConfig
+from transformers import AutoTokenizer, CLIPTextModel, CLIPTextModelWithProjection, PretrainedConfig
 from torch import autograd
 from typing import Optional, Tuple
 import pynvml
@@ -104,6 +104,8 @@ def parse_args(input_args=None):
     parser.add_argument("--resume_unet", type=str, default=None, help="File path for unet lora to resume training.")
     parser.add_argument("--resume_text_encoder", type=str, default=None, help="File path for text encoder lora to resume training.")
     parser.add_argument("--resize", action='store_true', help="Should images be resized to --resolution after attacking? (true/false)")
+    parser.add_argument("--surrogate", type=str, default="sd21", choices=["sd21", "sdxl"],
+                        help="Surrogate model backbone: 'sd21' (SD 2.1 @ 768px) or 'sdxl' (SDXL @ 1024px).")
 
     # Parse the arguments from input_args or from sys.argv if input_args is None
     args = parser.parse_args(input_args)
@@ -146,6 +148,9 @@ def parse_args(input_args=None):
         if not os.path.exists(args.output_dir):
             os.makedirs(args.output_dir, exist_ok=True)
             print(Back.BLUE + Fore.GREEN + 'create output dir: {}'.format(args.output_dir))
+
+    if args.surrogate == "sdxl":
+        args.resolution = 1024
 
     return args
 
@@ -320,11 +325,12 @@ def train_one_epoch(
     weight_dtype=torch.bfloat16,
 ):
     # prepare training data
+    actual_tokenizer = tokenizer[0] if isinstance(tokenizer, tuple) else tokenizer
     train_dataset = DreamBoothDatasetFromTensor(
         data_tensor,
         prompts,
         args.instance_prompt,
-        tokenizer,
+        actual_tokenizer,
         args.class_data_dir,
         args.class_prompt,
         args.resolution,
@@ -334,7 +340,9 @@ def train_one_epoch(
     device = accelerator.device
 
     # prepare models & inject lora layers
+    is_sdxl = len(models) == 3
     unet, text_encoder = copy.deepcopy(models[0]), copy.deepcopy(models[1])
+    text_encoder_2 = copy.deepcopy(models[2]) if is_sdxl else None
     vae.to(device)
     vae.requires_grad_(False)
     text_encoder.to(device)
@@ -525,9 +533,63 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0, error_if_nonfinite=True)
             optimizer.step()
             optimizer.zero_grad()
-    
+
+    if is_sdxl:
+        return [unet, text_encoder, text_encoder_2]
     return [unet, text_encoder]
 
+
+
+def compute_sdxl_noise_pred(
+    unet,
+    text_encoder_1,
+    text_encoder_2,
+    noisy_latents: torch.Tensor,
+    timestep: torch.Tensor,
+    prompt_ids: tuple,
+    resolution: int,
+    device,
+    dtype,
+) -> torch.Tensor:
+    """Dual-encode text, apply SDXL time conditioning, return UNet noise prediction.
+
+    Pure function — no Mist loop state — designed for extraction into Phase 3 SDXLSurrogate.
+    """
+    input_ids_1, input_ids_2 = prompt_ids
+
+    # text_encoder_1 (CLIPTextModel): penultimate hidden state → [B, 77, 768]
+    enc1 = text_encoder_1(input_ids_1, output_hidden_states=True)
+    hidden_states_1 = enc1.hidden_states[-2]
+
+    # text_encoder_2 (CLIPTextModelWithProjection):
+    #   hidden_states[-2] → sequence features [B, 77, 1280]
+    #   enc2[0]           → pooled text_embeds  [B, 1280]
+    enc2 = text_encoder_2(input_ids_2, output_hidden_states=True)
+    hidden_states_2 = enc2.hidden_states[-2]
+    pooled_output = enc2[0]
+
+    # Concatenate along feature dim → [B, 77, 2048]
+    encoder_hidden_states = torch.cat([hidden_states_1, hidden_states_2], dim=-1).to(dtype=dtype)
+
+    # SDXL time ids: [orig_h, orig_w, crop_top, crop_left, target_h, target_w]
+    bsz = noisy_latents.shape[0]
+    add_time_ids = torch.tensor(
+        [resolution, resolution, 0, 0, resolution, resolution],
+        dtype=dtype,
+        device=device,
+    ).unsqueeze(0).expand(bsz, -1)
+
+    added_cond_kwargs = {
+        "text_embeds": pooled_output.to(dtype=dtype),
+        "time_ids": add_time_ids,
+    }
+
+    return unet(
+        noisy_latents,
+        timestep,
+        encoder_hidden_states,
+        added_cond_kwargs=added_cond_kwargs,
+    ).sample
 
 
 def pgd_attack(
@@ -546,17 +608,28 @@ def pgd_attack(
 
     num_steps = args.max_adv_train_steps
 
-    unet, text_encoder = models
+    is_sdxl = len(models) == 3
+    if is_sdxl:
+        unet, text_encoder_1, text_encoder_2 = models
+        tokenizer_1, tokenizer_2 = tokenizer
+    else:
+        unet, text_encoder = models
     device = accelerator.device
 
     vae.to(device, dtype=weight_dtype)
-    text_encoder.to(device, dtype=weight_dtype)
     unet.to(device, dtype=weight_dtype)
     if args.low_vram_mode:
         unet.set_use_memory_efficient_attention_xformers(True)
     vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
     unet.requires_grad_(False)
+    if is_sdxl:
+        text_encoder_1.to(device, dtype=weight_dtype)
+        text_encoder_2.to(device, dtype=weight_dtype)
+        text_encoder_1.requires_grad_(False)
+        text_encoder_2.requires_grad_(False)
+    else:
+        text_encoder.to(device, dtype=weight_dtype)
+        text_encoder.requires_grad_(False)
     data_tensor = data_tensor.detach().clone()
     num_image = len(data_tensor)
 
@@ -583,14 +656,29 @@ def pgd_attack(
         perturbed_image = data_tensor[id, :].unsqueeze(0)
         perturbed_image.requires_grad = True
         original_image = original_images[id, :].unsqueeze(0)
-        input_ids = tokenizer(
-            args.instance_prompt,
-            truncation=True,
-            padding="max_length",
-            max_length=tokenizer.model_max_length,
-            return_tensors="pt",
-        ).input_ids
-        input_ids = input_ids.to(device)
+        if is_sdxl:
+            input_ids_1 = tokenizer_1(
+                args.instance_prompt,
+                truncation=True,
+                padding="max_length",
+                max_length=tokenizer_1.model_max_length,
+                return_tensors="pt",
+            ).input_ids.to(device)
+            input_ids_2 = tokenizer_2(
+                args.instance_prompt,
+                truncation=True,
+                padding="max_length",
+                max_length=tokenizer_2.model_max_length,
+                return_tensors="pt",
+            ).input_ids.to(device)
+        else:
+            input_ids = tokenizer(
+                args.instance_prompt,
+                truncation=True,
+                padding="max_length",
+                max_length=tokenizer.model_max_length,
+                return_tensors="pt",
+            ).input_ids.to(device)
         for step in range(num_steps):
             perturbed_image.requires_grad = False
             with torch.no_grad():
@@ -611,11 +699,16 @@ def pgd_attack(
             # (this is the forward diffusion process)
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-            # Get the text embedding for conditioning
-            encoder_hidden_states = text_encoder(input_ids)[0]
-
             # Predict the noise residual
-            model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+            if is_sdxl:
+                model_pred = compute_sdxl_noise_pred(
+                    unet, text_encoder_1, text_encoder_2,
+                    noisy_latents, timesteps, (input_ids_1, input_ids_2),
+                    args.resolution, device, weight_dtype,
+                )
+            else:
+                encoder_hidden_states = text_encoder(input_ids)[0]
+                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
             # Get the target for loss depending on the prediction type
             if noise_scheduler.config.prediction_type == "epsilon":
@@ -626,7 +719,11 @@ def pgd_attack(
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
             unet.zero_grad()
-            text_encoder.zero_grad()
+            if is_sdxl:
+                text_encoder_1.zero_grad()
+                text_encoder_2.zero_grad()
+            else:
+                text_encoder.zero_grad()
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
             # target-shift loss
@@ -774,35 +871,68 @@ def main(args):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    # import correct text encoder class
-    text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
+    if args.surrogate == "sdxl":
+        # SDXL dual text encoders + tokenizers
+        text_encoder_1 = CLIPTextModel.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="text_encoder",
+            variant="fp16",
+            torch_dtype=torch.float16,
+        )
+        text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="text_encoder_2",
+            variant="fp16",
+            torch_dtype=torch.float16,
+        )
+        unet = UNet2DConditionModel.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="unet",
+            variant="fp16",
+            torch_dtype=torch.float16,
+        )
+        unet.requires_grad_(False)
+        tokenizer_1 = AutoTokenizer.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="tokenizer",
+            use_fast=False,
+        )
+        tokenizer_2 = AutoTokenizer.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="tokenizer_2",
+            use_fast=False,
+        )
+        tokenizer = (tokenizer_1, tokenizer_2)
+    else:
+        # import correct text encoder class
+        text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
 
-    # Load scheduler and models
-    text_encoder = text_encoder_cls.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="text_encoder",
-        revision=args.revision,
-        variant="fp16",
-        torch_dtype=torch.float16,
-    )
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="unet",
-        revision=args.revision,
-        variant="fp16",
-        torch_dtype=torch.float16,
-    )
+        # Load scheduler and models
+        text_encoder = text_encoder_cls.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="text_encoder",
+            revision=args.revision,
+            variant="fp16",
+            torch_dtype=torch.float16,
+        )
+        unet = UNet2DConditionModel.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="unet",
+            revision=args.revision,
+            variant="fp16",
+            torch_dtype=torch.float16,
+        )
 
-    # add by lora
-    unet.requires_grad_(False)
-    # end: added by lora
+        # add by lora
+        unet.requires_grad_(False)
+        # end: added by lora
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="tokenizer",
-        revision=args.revision,
-        use_fast=False,
-    )
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="tokenizer",
+            revision=args.revision,
+            use_fast=False,
+        )
     
 
     noise_scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
@@ -829,7 +959,10 @@ def main(args):
 
     #print info about train_text_encoder
     
-    if not args.train_text_encoder:
+    if args.surrogate == "sdxl":
+        text_encoder_1.requires_grad_(False)
+        text_encoder_2.requires_grad_(False)
+    elif not args.train_text_encoder:
         text_encoder.requires_grad_(False)
 
     if args.allow_tf32:
@@ -862,7 +995,10 @@ def main(args):
         target_image_tensor = target_image_tensor.to('cpu')
         del target_image_tensor
         #target_latent_tensor = target_latent_tensor.repeat(len(perturbed_data), 1, 1, 1).cuda()
-    f = [unet, text_encoder]
+    if args.surrogate == "sdxl":
+        f = [unet, text_encoder_1, text_encoder_2]
+    else:
+        f = [unet, text_encoder]
     for i in range(args.max_train_steps):        
         f_sur = copy.deepcopy(f)
         perturbed_data = pgd_attack(
