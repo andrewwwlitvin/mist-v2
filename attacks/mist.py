@@ -565,8 +565,15 @@ def pgd_attack(
     if args.eps_map_path and os.path.exists(args.eps_map_path):
         import numpy as np
         eps_map_np = np.load(args.eps_map_path).astype(np.float32)  # H×W
-        eps_map_tensor = torch.from_numpy(eps_map_np).to("cuda", dtype=weight_dtype)
-        eps_map_tensor = eps_map_tensor.unsqueeze(0).unsqueeze(0)   # → [1, 1, H, W]
+        eps_map_tensor = torch.from_numpy(eps_map_np).unsqueeze(0).unsqueeze(0)  # → [1, 1, H, W]
+        # Resize to match mist's square resolution (--resolution N×N)
+        eps_map_tensor = torch.nn.functional.interpolate(
+            eps_map_tensor,
+            size=(args.resolution, args.resolution),
+            mode='bilinear',
+            align_corners=False,
+        )
+        eps_map_tensor = eps_map_tensor.to("cuda", dtype=weight_dtype)
 
     image_list = []
     tbar = tqdm(range(num_image))
