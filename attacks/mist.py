@@ -1140,7 +1140,9 @@ def main(args):
                 )
 
             w = args.w_grad_map
-            combined = (1.0 - w) * eps_map_tensor + w * gradient_map * eps_map_tensor.mean()
+            intersection = eps_map_tensor * gradient_map
+            intersection = intersection * (eps_map_tensor.mean() / intersection.mean())
+            combined = (1.0 - w) * eps_map_tensor + w * intersection
             combined = combined * (eps_map_tensor.mean() / combined.mean())
             eps_map_tensor = combined.clamp(min=0)
 
