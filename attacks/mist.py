@@ -106,6 +106,8 @@ def parse_args(input_args=None):
     parser.add_argument("--resize", action='store_true', help="Should images be resized to --resolution after attacking? (true/false)")
     parser.add_argument("--surrogate", type=str, default="sd21", choices=["sd21", "sdxl"],
                         help="Surrogate model backbone: 'sd21' (SD 2.1 @ 768px) or 'sdxl' (SDXL @ 1024px).")
+    parser.add_argument("--w_grad_map", type=float, default=0.4,
+                        help="Weight of gradient map vs perceptual map (0=perceptual only, 1=gradient only)")
 
     # Parse the arguments from input_args or from sys.argv if input_args is None
     args = parser.parse_args(input_args)
@@ -626,6 +628,88 @@ def compute_sdxl_noise_pred(
     ).sample
 
 
+def build_gradient_map(
+    instance_image_path: str,
+    vae,
+    unet,
+    text_encoder,
+    tokenizer,
+    noise_scheduler,
+    resolution: int,
+    device,
+    weight_dtype,
+    text_encoder_2=None,
+    tokenizer_2=None,
+    instance_prompt: str = "",
+) -> torch.Tensor:
+    """
+    Single forward-backward pass through the surrogate UNet.
+    Returns H×W float32 tensor (values 0–1) on CPU.
+    High values = surrogate is sensitive here = more epsilon is effective.
+    """
+    try:
+        is_sdxl = text_encoder_2 is not None and tokenizer_2 is not None
+
+        # 1. Load and resize instance image
+        img = Image.open(instance_image_path).convert("RGB").resize((resolution, resolution))
+        img_np = np.array(img).astype(np.float32) / 127.5 - 1.0
+        pixel_tensor = torch.from_numpy(img_np.transpose(2, 0, 1)).unsqueeze(0)  # [1,3,H,W]
+        pixel_tensor = pixel_tensor.to(device, dtype=weight_dtype)
+
+        # 2. requires_grad on pixel tensor for gradient w.r.t. input pixels
+        pixel_tensor.requires_grad_(True)
+
+        # 3. Encode to latents via VAE (no_grad on VAE params, grad flows through pixels)
+        latents = vae.encode(pixel_tensor).latent_dist.mean
+        latents = latents * vae.config.scaling_factor
+
+        # 4. Add noise at mid-point timestep t=500
+        noise = torch.randn_like(latents)
+        t = torch.tensor([500], device=device, dtype=torch.long)
+        noisy_latents = noise_scheduler.add_noise(latents, noise, t)
+
+        # 5+6. Encode prompt and get UNet noise prediction
+        if is_sdxl:
+            with torch.no_grad():
+                input_ids_1 = tokenizer(
+                    instance_prompt, truncation=True, padding="max_length",
+                    max_length=tokenizer.model_max_length, return_tensors="pt",
+                ).input_ids.to(device)
+                input_ids_2 = tokenizer_2(
+                    instance_prompt, truncation=True, padding="max_length",
+                    max_length=tokenizer_2.model_max_length, return_tensors="pt",
+                ).input_ids.to(device)
+            model_pred = compute_sdxl_noise_pred(
+                unet, text_encoder, text_encoder_2,
+                noisy_latents, t, (input_ids_1, input_ids_2),
+                resolution, device, weight_dtype,
+            )
+        else:
+            with torch.no_grad():
+                input_ids = tokenizer(
+                    instance_prompt, truncation=True, padding="max_length",
+                    max_length=tokenizer.model_max_length, return_tensors="pt",
+                ).input_ids.to(device)
+                encoder_hidden_states = text_encoder(input_ids)[0]
+            model_pred = unet(noisy_latents, t, encoder_hidden_states).sample
+
+        # 7. MSE loss against added noise → backward
+        loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+        loss.backward()
+
+        # 8. Pixel gradient magnitude → mean across C → normalise to [0,1]
+        grad = pixel_tensor.grad.detach().abs()  # [1,3,H,W]
+        grad_map = grad.squeeze(0).mean(dim=0)   # [H,W]
+        g_min, g_max = grad_map.min(), grad_map.max()
+        grad_map = (grad_map - g_min) / (g_max - g_min + 1e-8)
+
+        return grad_map.float().cpu()
+
+    except Exception as e:
+        print(f"[WARNING] build_gradient_map failed: {e}. Using neutral fallback.")
+        return torch.ones(resolution, resolution) * 0.5
+
+
 def pgd_attack(
     args,
     accelerator,
@@ -637,6 +721,7 @@ def pgd_attack(
     original_images: torch.Tensor,
     target_tensor: torch.Tensor,
     weight_dtype = torch.bfloat16,
+    eps_map_tensor = None,
 ):
     """Return new perturbed data"""
 
@@ -666,21 +751,6 @@ def pgd_attack(
         text_encoder.requires_grad_(False)
     data_tensor = data_tensor.detach().clone()
     num_image = len(data_tensor)
-
-    # Load adaptive epsilon map if provided
-    eps_map_tensor = None
-    if args.eps_map_path and os.path.exists(args.eps_map_path):
-        import numpy as np
-        eps_map_np = np.load(args.eps_map_path).astype(np.float32)  # H×W
-        eps_map_tensor = torch.from_numpy(eps_map_np).unsqueeze(0).unsqueeze(0)  # → [1, 1, H, W]
-        # Resize to match mist's square resolution (--resolution N×N)
-        eps_map_tensor = torch.nn.functional.interpolate(
-            eps_map_tensor,
-            size=(args.resolution, args.resolution),
-            mode='bilinear',
-            align_corners=False,
-        )
-        eps_map_tensor = eps_map_tensor.to("cuda", dtype=weight_dtype)
 
     image_list = []
     tbar = tqdm(range(num_image))
@@ -1010,6 +1080,66 @@ def main(args):
     original_data = perturbed_data.clone()
     original_data.requires_grad_(False)
 
+    # Load adaptive epsilon map if provided
+    eps_map_tensor = None
+    if args.eps_map_path and os.path.exists(args.eps_map_path):
+        eps_map_np = np.load(args.eps_map_path).astype(np.float32)  # H×W
+        eps_map_tensor = torch.from_numpy(eps_map_np).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+        eps_map_tensor = F.interpolate(
+            eps_map_tensor,
+            size=(args.resolution, args.resolution),
+            mode='bilinear',
+            align_corners=False,
+        )
+        eps_map_tensor = eps_map_tensor.to(accelerator.device, dtype=weight_dtype)
+
+        # Derive first instance image path (first .png in instance_data_dir)
+        first_instance_image_path = None
+        for filename in os.listdir(args.instance_data_dir):
+            if filename.lower().endswith(".png"):
+                first_instance_image_path = os.path.join(args.instance_data_dir, filename)
+                break
+
+        if first_instance_image_path is not None:
+            print("Building gradient map...")
+            t_grad = time.time()
+
+            tok2 = tokenizer[1] if args.surrogate == "sdxl" else None
+            enc2 = text_encoder_2 if args.surrogate == "sdxl" else None
+
+            gradient_map = build_gradient_map(
+                instance_image_path=first_instance_image_path,
+                vae=vae,
+                unet=unet,
+                text_encoder=text_encoder_1 if args.surrogate == "sdxl" else text_encoder,
+                tokenizer=tokenizer[0] if isinstance(tokenizer, tuple) else tokenizer,
+                noise_scheduler=noise_scheduler,
+                resolution=args.resolution,
+                device=accelerator.device,
+                weight_dtype=weight_dtype,
+                text_encoder_2=enc2,
+                tokenizer_2=tok2,
+                instance_prompt=args.instance_prompt,
+            )
+
+            gradient_map = gradient_map.unsqueeze(0).unsqueeze(0).to(
+                eps_map_tensor.device, dtype=eps_map_tensor.dtype
+            )
+            if gradient_map.shape[-2:] != eps_map_tensor.shape[-2:]:
+                gradient_map = F.interpolate(
+                    gradient_map,
+                    size=eps_map_tensor.shape[-2:],
+                    mode='bilinear', align_corners=False,
+                )
+
+            w = args.w_grad_map
+            combined = (1.0 - w) * eps_map_tensor + w * gradient_map * eps_map_tensor.mean()
+            combined = combined * (eps_map_tensor.mean() / combined.mean())
+            eps_map_tensor = combined.clamp(min=0)
+
+            print(f"Gradient map applied (w={w}) | "
+                  f"eps range: {eps_map_tensor.min():.4f}–{eps_map_tensor.max():.4f} | "
+                  f"{time.time()-t_grad:.1f}s")
 
     target_latent_tensor = None
     if args.target_image_path is not None and args.target_image_path != "":
@@ -1046,6 +1176,7 @@ def main(args):
             original_data,
             target_latent_tensor,
             weight_dtype,
+            eps_map_tensor,
         )
         del f_sur
         if args.cuda:
