@@ -1141,12 +1141,13 @@ def main(args):
 
             w = args.w_grad_map
             intersection = eps_map_tensor * gradient_map
-            intersection = intersection * (eps_map_tensor.mean() / intersection.mean())
+            intersection = intersection * (eps_map_tensor.mean() / (intersection.mean() + 1e-8))
             combined = (1.0 - w) * eps_map_tensor + w * intersection
-            # Clamp to perceptual ceiling before renormalising — prevents
-            # sparse gradient map from amplifying peaks to absurd levels
-            combined = combined.clamp(0, eps_map_tensor.max())
             combined = combined * (eps_map_tensor.mean() / combined.mean())
+            # Hard ceiling after renormalisation — clamp last, no second renorm
+            # Accepts marginal mean drift (slightly below base_eps) in exchange
+            # for guaranteed perceptual ceiling
+            combined = combined.clamp(0, eps_map_tensor.max())
             eps_map_tensor = combined
 
             print(f"Gradient map applied (w={w}) | "
