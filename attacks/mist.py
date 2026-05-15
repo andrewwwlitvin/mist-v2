@@ -1143,8 +1143,11 @@ def main(args):
             intersection = eps_map_tensor * gradient_map
             intersection = intersection * (eps_map_tensor.mean() / intersection.mean())
             combined = (1.0 - w) * eps_map_tensor + w * intersection
+            # Clamp to perceptual ceiling before renormalising — prevents
+            # sparse gradient map from amplifying peaks to absurd levels
+            combined = combined.clamp(0, eps_map_tensor.max())
             combined = combined * (eps_map_tensor.mean() / combined.mean())
-            eps_map_tensor = combined.clamp(min=0)
+            eps_map_tensor = combined
 
             print(f"Gradient map applied (w={w}) | "
                   f"eps range: {eps_map_tensor.min():.4f}–{eps_map_tensor.max():.4f} | "
