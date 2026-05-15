@@ -650,12 +650,12 @@ def build_gradient_map(
     try:
         is_sdxl = text_encoder_2 is not None and tokenizer_2 is not None
 
-        # Ensure all models are on the target device before any forward pass
-        vae.to(device)
-        text_encoder.to(device)
-        unet.to(device)
+        # Ensure all models are on the target device and dtype before any forward pass
+        vae.to(device, dtype=weight_dtype)
+        text_encoder.to(device, dtype=weight_dtype)
+        unet.to(device, dtype=weight_dtype)
         if is_sdxl:
-            text_encoder_2.to(device)
+            text_encoder_2.to(device, dtype=weight_dtype)
 
         # 1. Load and resize instance image
         img = Image.open(instance_image_path).convert("RGB").resize((resolution, resolution))
